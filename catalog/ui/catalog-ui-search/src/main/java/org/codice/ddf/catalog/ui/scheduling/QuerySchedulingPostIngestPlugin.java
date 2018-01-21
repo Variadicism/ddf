@@ -8,7 +8,6 @@ import com.google.common.annotations.VisibleForTesting;
 import ddf.catalog.CatalogFramework;
 import ddf.catalog.Constants;
 import ddf.catalog.data.Metacard;
-import ddf.catalog.federation.FederationException;
 import ddf.catalog.operation.CreateResponse;
 import ddf.catalog.operation.DeleteResponse;
 import ddf.catalog.operation.Query;
@@ -456,7 +455,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
 
     for (Metacard metacard : metacards) {
       // TODO TEMP
-      LOGGER.debug(
+      LOGGER.warn(
           String.format("Processing metacard of type %s...", metacard.getMetacardType().getName()));
       processMetacard(metacard, metacardAction)
           .elseDo(error -> errors.add(ImmutablePair.of(metacard, error)));
