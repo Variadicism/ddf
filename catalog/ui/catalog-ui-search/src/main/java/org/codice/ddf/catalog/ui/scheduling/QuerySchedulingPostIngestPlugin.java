@@ -8,6 +8,7 @@ import com.google.common.annotations.VisibleForTesting;
 import ddf.catalog.CatalogFramework;
 import ddf.catalog.Constants;
 import ddf.catalog.data.Metacard;
+import ddf.catalog.federation.FederationException;
 import ddf.catalog.operation.CreateResponse;
 import ddf.catalog.operation.DeleteResponse;
 import ddf.catalog.operation.Query;
@@ -20,6 +21,8 @@ import ddf.catalog.operation.impl.QueryImpl;
 import ddf.catalog.operation.impl.QueryRequestImpl;
 import ddf.catalog.plugin.PluginExecutionException;
 import ddf.catalog.plugin.PostIngestPlugin;
+import ddf.catalog.source.SourceUnavailableException;
+import ddf.catalog.source.UnsupportedQueryException;
 import ddf.security.Subject;
 import ddf.util.Fallible;
 import ddf.util.MapUtils;
@@ -166,7 +169,6 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
       return error("A task cannot be executed every %d %s!", scheduleInterval, scheduleUnit);
     }
 
-    DateTime now = DateTime.now();
     DateTime start;
     DateTime end;
     try {
@@ -184,9 +186,6 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
           scheduleStartString, exception.getMessage());
     }
 
-    long nowStartDiff = start.minus(now.getMillis()).getMillis();
-    long startEndDiff = end.minus(start.getMillis()).getMillis();
-
     RepetitionTimeUnit unit;
     try {
       unit = RepetitionTimeUnit.valueOf(scheduleUnit.toUpperCase());
@@ -196,67 +195,29 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
           scheduleUnit);
     }
 
-    final long unitsBeforeWeStart;
-    final long unitsBeforeWeEnd;
-    switch (unit) {
-      case MINUTES:
-        unitsBeforeWeStart = nowStartDiff / (1000L * 60L);
-        unitsBeforeWeEnd = 1 + unitsBeforeWeStart + startEndDiff / (1000L * 60L);
-        break;
-      case HOURS:
-        unitsBeforeWeStart = nowStartDiff / (1000L * 60L * 60L);
-        unitsBeforeWeEnd = 1 + unitsBeforeWeStart + startEndDiff / (1000L * 60L * 60L);
-        break;
-      case DAYS:
-        unitsBeforeWeStart = nowStartDiff / (1000L * 60L * 60L * 24L);
-        unitsBeforeWeEnd = 1 + unitsBeforeWeStart + startEndDiff / (1000L * 60L * 60L * 24L);
-        break;
-      case WEEKS:
-        unitsBeforeWeStart = nowStartDiff / (1000L * 60L * 60L * 24L * 7L);
-        unitsBeforeWeEnd = 1 + unitsBeforeWeStart + startEndDiff / (1000L * 60L * 60L * 24L * 7L);
-        break;
-      case MONTHS:
-        // TODO: Months need some work because days/month varies
-        unitsBeforeWeStart = unitsBeforeWeEnd = 1;
-        //        unitsBeforeWeStart = 1 + nowStartDiff / (1000L * 60L * 60L * 24L * 7L * 12L);
-        //        unitsBeforeWeEnd = unitsBeforeWeStart + startEndDiff / (1000L * 60L * 60L * 24L *
-        // 7L * (end.getDayOfYear() - start.getDayOfYear()));
-        break;
-      case YEARS:
-        unitsBeforeWeStart = nowStartDiff / (1000L * 60L * 60L * 24L * 365L);
-        unitsBeforeWeEnd = 1 + unitsBeforeWeStart + startEndDiff / (1000L * 60L * 60L * 24L * 365L);
-        break;
-      default:
-        unitsBeforeWeStart = 1;
-        unitsBeforeWeEnd = 1;
-        break;
-    }
-
-    LOGGER.warn(
-        "We'll be repeating this {} times...",
-        Math.ceil((unitsBeforeWeEnd - unitsBeforeWeStart) / scheduleInterval));
-
     final QuerySchedulingPostIngestPlugin thisPlugin = this;
     final SchedulerFuture<?> job =
         scheduler.scheduleLocal(
             new Runnable() {
-              private long unitsPassedSinceStarted = 0;
+              //Set this >= scheduleInterval - 1 so that a scheduled query executes the first time it is able
+              private int unitsPassedSinceStarted = scheduleInterval;
 
               @Override
               public void run() {
                 // TODO: Figure out how to cancel the job when the end date-time is reached.
-                if (unitsPassedSinceStarted >= unitsBeforeWeEnd) {
+                if (end.compareTo(DateTime.now()) >= 0) {
+                  if (start.compareTo(DateTime.now()) <= 0) {
+                    if (unitsPassedSinceStarted >= scheduleInterval - 1) {
+                      unitsPassedSinceStarted = 0;
+                      thisPlugin.emailOwner(queryMetacardData).elseDo(LOGGER::error);
+                    } else {
+                      unitsPassedSinceStarted++;
+                    }
+                  }
+                } else {
                   LOGGER.warn("Ending scheduled query...");
                   thisPlugin.cancelSchedule(queryMetacardData).elseDo(LOGGER::error);
-                  return;
                 }
-                if (unitsPassedSinceStarted >= unitsBeforeWeStart
-                    && (unitsPassedSinceStarted - unitsBeforeWeStart) % scheduleInterval == 0) {
-                  //                  unitsPassedSinceStarted = 0;
-                  thisPlugin.emailOwner(queryMetacardData).elseDo(LOGGER::error);
-                } // else {
-                unitsPassedSinceStarted++;
-                //                }
               }
             },
             unit.makeCronToRunEachUnit(
@@ -334,61 +295,42 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                       QUERY_TIMEOUT_MS);
               final QueryRequest queryRequest = new QueryRequestImpl(query, true);
 
-              QueryResponse queryResults;
-              //              try {
+              Fallible<QueryResponse> queryResults;
+
               Subject systemSubject = SECURITY.runAsAdmin(SECURITY::getSystemSubject);
-              queryResults = systemSubject.execute(() -> catalogFramework.query(queryRequest));
-              //                  {
-              //                  try {
-              //                    catalogFramework.query(queryRequest);
-              //                  } catch (UnsupportedQueryException exception) {
-              //                    return error(
-              //                        "The query \"%s\" is not supported by the given catalog
-              // framework: %s",
-              //                    cqlQuery, exception.getMessage());
-              //                  } catch (SourceUnavailableException exception) {
-              //                    return error(
-              //                        "The catalog framework sources were unavailable: " +
-              //                            exception.getMessage());
-              //                  } catch (FederationException exception) {
-              //                    return error(
-              //                        "There was a problem with executing a federated search for
-              // the query \"%s\": %s",
-              //                        cqlQuery, exception.getMessage());
-              //                  }
-              //                }
-              //              ));
-              //                            } catch (UnsupportedQueryException exception) {
-              //                              return error(
-              //                                  "The query \"%s\" is not supported by the given
-              // catalog
-              //               framework: %s",
-              //                                  cqlQuery, exception.getMessage());
-              //                            } catch (SourceUnavailableException exception) {
-              //                              return error(
-              //                                  "The catalog framework sources were unavailable: "
-              // +
-              //               exception.getMessage());
-              //                            } catch (FederationException exception) {
-              //                              return error(
-              //                                  "There was a problem with executing a federated
-              // search for the
-              //               query \"%s\": %s",
-              //                                  cqlQuery, exception.getMessage());
-              //                            }
+              queryResults =
+                  systemSubject.execute(
+                      () -> {
+                        try {
+                          return of(catalogFramework.query(queryRequest));
+                        } catch (UnsupportedQueryException exception) {
+                          return error(
+                              "The query \"%s\" is not supported by the given catalog framework: %s",
+                              cqlQuery, exception.getMessage());
+                        } catch (SourceUnavailableException exception) {
+                          return error(
+                              "The catalog framework sources were unavailable: %s",
+                              exception.getMessage());
+                        } catch (FederationException exception) {
+                          return error(
+                              "There was a problem with executing a federated search for the query \"%s\": %s",
+                              cqlQuery, exception.getMessage());
+                        }
+                      });
 
-              final Map<String, Pair<WorkspaceMetacardImpl, Long>> notifiableQueryResults =
-                  MapUtils.fromList(
-                      queryResults.getResults(),
-                      result -> result.getMetacard().getId(),
-                      result ->
-                          Pair.of(
-                              WorkspaceMetacardImpl.from(result.getMetacard()),
-                              queryResults.getHits()));
+              return queryResults.ifValue(
+                  qr -> {
+                    final Map<String, Pair<WorkspaceMetacardImpl, Long>> notifiableQueryResults =
+                        MapUtils.fromList(
+                            qr.getResults(),
+                            result -> result.getMetacard().getId(),
+                            result ->
+                                Pair.of(
+                                    WorkspaceMetacardImpl.from(result.getMetacard()),
+                                    qr.getHits()));
 
-              emailNotifierService.notify(notifiableQueryResults);
-
-              return success();
+                    emailNotifierService.notify(notifiableQueryResults);
+                  });
             });
   }
 
@@ -439,9 +381,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                                 id -> {
                                   final @Nullable SchedulerFuture<?> job = runningQueries.get(id);
                                   if (job == null) {
-                                    return error(
-                                        "This job scheduled under the ID \"%s\" was not found in the scheduled queries job cache!",
-                                        id);
+                                    return success().mapValue(null);
                                   } else if (job.isCancelled()) {
                                     return error(
                                         "This job scheduled under the ID \"%s\" cannot be cancelled because it is not running!",
@@ -501,7 +441,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
               .map(
                   metacardAndError ->
                       String.format(
-                          "There was an error attempting to schedule execution of workspace metacard \"%s\": %s",
+                          "There was an error attempting to modify schedule execution of workspace metacard \"%s\": %s",
                           metacardAndError.getLeft().getId(), metacardAndError.getRight()))
               .collect(Collectors.joining("\n")));
     }
