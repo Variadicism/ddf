@@ -17,16 +17,23 @@ define([
         'properties',
         'js/cql',
         'js/model/QueryResponse',
+        'js/model/QuerySchedule',
         'component/singletons/sources-instance',
         'js/Common',
         'js/CacheSourceSelector',
         'component/announcement',
         'js/CQLUtils',
         'component/singletons/user-instance',
+        'lodash/merge',
         'backboneassociations',
     ],
+<<<<<<< Updated upstream
     function (Backbone, _, properties, cql, QueryResponse, Sources, Common, CacheSourceSelector, announcement,
+        CQLUtils, user, _merge) {
+=======
+    function (Backbone, _, properties, cql, QueryResponse, QuerySchedule, Sources, Common, CacheSourceSelector, announcement,
         CQLUtils, user) {
+>>>>>>> Stashed changes
         "use strict";
         var Query = {};
 
@@ -64,13 +71,17 @@ define([
                 key: 'result',
                 relatedModel: QueryResponse,
                 isTransient: true
+            }, {
+                type: Backbone.Many,
+                key: 'schedules',
+                relatedModel: QuerySchedule
             }],
             //in the search we are checking for whether or not the model
             //only contains 5 items to know if we can search or not
             //as soon as the model contains more than 5 items, we assume
             //that we have enough values to search
             defaults: function () {
-                return {
+                return _merge({
                     cql: "anyText ILIKE ''",
                     title: 'Search Name',
                     excludeUnnecessaryAttributes: true,
@@ -81,15 +92,26 @@ define([
                     sortOrder: 'descending',
                     result: undefined,
                     serverPageIndex: 0,
-                    isAdvanced: false,
+                    type: 'text',
                     isLocal: false,
-                    isScheduled: false,
-                    //scheduleOptions: { amountValue: 1, unitValue: 'weeks', startValue: '', endValue: '' }
-                    scheduleAmount: 1,
-                    scheduleUnit: 'weeks',
-                    scheduleStart: '',
-                    scheduleEnd: ''
-                };
+                    schedules: []
+                    // isScheduled: false,
+                    // scheduleAmount: 1,
+                    // scheduleUnit: 'weeks',
+                    // scheduleStart: '',
+                    // scheduleEnd: '',
+                    // subscribedUsers: []
+                }, user.getQuerySettings().toJSON());
+            },
+            resetToDefaults: function() {
+                this.set(_.omit(this.defaults(), ['type', 'isLocal', 'serverPageIndex', 'result']));
+                this.trigger('resetToDefaults');
+            },
+            applyDefaults: function() {
+                this.set(_.pick(this.defaults(), ['sortField', 'sortOrder', 'federation', 'src']));
+            },
+            revert: function() {
+                this.trigger('revert');
             },
             isLocal: function() {
                 return this.get('isLocal');
