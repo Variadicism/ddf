@@ -150,7 +150,23 @@ define([
                 theme: new Theme(),
                 animation: true,
                 hoverPreview: true,
-                querySettings: new QuerySettings()
+                querySettings: new QuerySettings(),
+                deliveryMethods: [{
+                    userSpecifiedName: 'Joshs Cool Email Service',
+                    deliveryId: 'b6d051a1-a40f-45e2-843f-d0d8d9742940',
+                    deliveryOptions: {
+                        email: 'joshua.mack@connexta.com'
+                    }
+                }, {
+                    userSpecifiedName: 'Joshs Cool FTP Service',
+                    deliveryId: '80607086-f912-465f-9663-20cafd754c28',
+                    deliveryOptions: {
+                        hostname: 'hostname@ftp.com',
+                        port: 1234,
+                        username: 'joshua.mack',
+                        password: 'secret'
+                    }
+                }]
             };
         },
         relations: [
