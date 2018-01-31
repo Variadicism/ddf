@@ -752,7 +752,7 @@ public class MetacardApplication implements SparkApplication {
           for (QueryDeliveryService service : deliveryServices) {
             tempMap = new HashMap<>();
             // TODO: Replace with a constant keys somewhere and add a displayName key as well
-            tempMap.put(QueryDeliveryService.SUBSCRIBER_TYPE_KEY, service.getDeliveryType());
+            tempMap.put(QueryDeliveryService.DELIVERY_TYPE_KEY, service.getDeliveryType());
             tempMap.put(QueryDeliveryService.DISPLAY_NAME_KEY, service.getDisplayName());
             List<Map<String, String>> fieldsList = new ArrayList<>();
             for (QueryDeliveryParameter field : service.getRequiredFields()) {
