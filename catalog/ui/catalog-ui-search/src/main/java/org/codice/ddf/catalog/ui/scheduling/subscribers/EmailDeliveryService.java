@@ -5,6 +5,7 @@ import static ddf.util.Fallible.success;
 
 import com.google.common.collect.ImmutableCollection;
 import com.google.common.collect.ImmutableSet;
+import ddf.catalog.data.Attribute;
 import ddf.catalog.data.AttributeDescriptor;
 import ddf.catalog.data.Metacard;
 import ddf.catalog.data.Result;
@@ -115,9 +116,10 @@ public class EmailDeliveryService implements QueryDeliveryService {
                   for (AttributeDescriptor attributeDescriptor :
                       metacard.getMetacardType().getAttributeDescriptors()) {
                     final String key = attributeDescriptor.getName();
-
-                    emailBody.append(
-                        String.format("\n%s: %s", key, metacard.getAttribute(key).getValue()));
+                    final Attribute attribute = metacard.getAttribute(key);
+                    if (attribute != null) {
+                      emailBody.append(String.format("\n%s: %s", key, attribute.getValue()));
+                    }
                   }
                 }
 
@@ -136,9 +138,6 @@ public class EmailDeliveryService implements QueryDeliveryService {
                       exception.getMessage());
                 }
 
-                // TODO TEMP
-                LoggerFactory.getLogger(EmailDeliveryService.class)
-                    .info("Email body:\n" + emailBody.toString());
                 smtpClient.send(message);
 
                 return success();
