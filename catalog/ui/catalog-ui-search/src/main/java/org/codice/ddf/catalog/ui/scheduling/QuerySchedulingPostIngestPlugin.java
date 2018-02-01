@@ -1,9 +1,13 @@
 /**
  * Copyright (c) Codice Foundation
  *
+ * <p>
+ *
  * <p>This is free software: you can redistribute it and/or modify it under the terms of the GNU
  * Lesser General Public License as published by the Free Software Foundation, either version 3 of
  * the License, or any later version.
+ *
+ * <p>
  *
  * <p>This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
  * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
@@ -60,6 +64,7 @@ import org.apache.ignite.IgniteState;
 import org.apache.ignite.Ignition;
 import org.apache.ignite.scheduler.SchedulerFuture;
 import org.apache.ignite.transactions.TransactionException;
+import org.boon.json.JsonException;
 import org.boon.json.JsonFactory;
 import org.codice.ddf.catalog.ui.metacard.workspace.QueryMetacardTypeImpl;
 import org.codice.ddf.catalog.ui.metacard.workspace.WorkspaceAttributes;
@@ -136,74 +141,6 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
 
     // TODO TEMP
     LOGGER.warn("Query scheduling plugin created!");
-  }
-
-  // TODO: refactor this method so that we can get user preferences once, not for every delivery ID
-  private Fallible<Pair<String, Map<String, Object>>> getDeliveryInfo(
-      final String username, final String deliveryID) {
-    List<Map<String, Object>> preferencesList;
-    try {
-      preferencesList =
-          persistentStore.get(
-              PersistenceType.PREFERENCES_TYPE.toString(), String.format("user = '%s'", username));
-    } catch (PersistenceException exception) {
-      return error(
-          "There was a problem attempting to retrieve the preferences for user '%s': %s",
-          username, exception.getMessage());
-    }
-    if (preferencesList.size() != 1) {
-      return error(
-          "There were %d preference entries found for user '%s'!",
-          preferencesList.size(), username);
-    }
-    final Map<String, Object> preferencesItem = preferencesList.get(0);
-
-    return MapUtils.tryGet(preferencesItem, "preferences_json_bin", byte[].class)
-        .tryMap(
-            json -> {
-              final Map<String, Object> preferences =
-                  JsonFactory.create()
-                      .parser()
-                      .parseMap(new String(json, Charset.defaultCharset()));
-
-              return MapUtils.tryGet(preferences, DELIVERY_METHODS_KEY, List.class)
-                  .tryMap(
-                      usersDestinations -> {
-                        final List<Map<String, Object>> matchingDestinations =
-                            ((List<Map<String, Object>>) usersDestinations)
-                                .stream()
-                                .filter(
-                                    destination ->
-                                        MapUtils.tryGet(
-                                                destination, DELIVERY_METHOD_ID_KEY, String.class)
-                                            .map(deliveryID::equals)
-                                            .orDo(
-                                                error -> {
-                                                  LOGGER.error(
-                                                      "There was a problem attempting to retrieve the ID for a destination in the preferences for user '%s': %s",
-                                                      username, error);
-                                                  return false;
-                                                }))
-                                .collect(Collectors.toList());
-                        if (matchingDestinations.size() != 1) {
-                          return error(
-                              "There were %d destinations matching the ID \"%s\" for user '%s'; only one is suspected!",
-                              matchingDestinations.size(), deliveryID, username);
-                        }
-                        final Map<String, Object> destinationData = matchingDestinations.get(0);
-
-                        return MapUtils.tryGetAndRun(
-                            destinationData,
-                            QueryDeliveryService.DELIVERY_TYPE_KEY,
-                            String.class,
-                            DELIVERY_OPTIONS_KEY,
-                            Map.class,
-                            (deliveryType, deliveryOptions) ->
-                                of(
-                                    new ImmutablePair<>(
-                                        deliveryType, (Map<String, Object>) deliveryOptions)));
-                      });
-            });
   }
 
   private Fallible<QueryResponse> runQuery(final String cqlQuery) {
@@ -293,30 +230,110 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
         .deliver(queryMetacardData, results, username, deliveryID, deliveryParameters);
   }
 
+  // TODO: change instances of "username" to "userID" now that the user's ID is being used instead
+  // of the username
+  private Fallible<Map<String, Object>> getUserPreferences(final String username) {
+    List<Map<String, Object>> preferencesList;
+    try {
+      preferencesList =
+          persistentStore.get(
+              PersistenceType.PREFERENCES_TYPE.toString(), String.format("user = '%s'", username));
+    } catch (PersistenceException exception) {
+      return error(
+          "There was a problem attempting to retrieve the preferences for user '%s': %s",
+          username, exception.getMessage());
+    }
+    if (preferencesList.size() != 1) {
+      return error(
+          "There were %d preference entries found for user '%s'!",
+          preferencesList.size(), username);
+    }
+    final Map<String, Object> preferencesItem = preferencesList.get(0);
+
+    return MapUtils.tryGet(preferencesItem, "preferences_json_bin", byte[].class)
+        .tryMap(
+            json -> {
+              final Map<String, Object> preferences;
+              try {
+                preferences =
+                    JsonFactory.create()
+                        .parser()
+                        .parseMap(new String(json, Charset.defaultCharset()));
+              } catch (JsonException exception) {
+                return error(
+                    "There was an error parsing the preferences for user '%s': %s",
+                    username, exception.getMessage());
+              }
+
+              return of(preferences);
+            });
+  }
+
+  private Fallible<Pair<String, Map<String, Object>>> getDeliveryInfo(
+      final Map<String, Object> userPreferences, final String deliveryID) {
+    return MapUtils.tryGet(userPreferences, DELIVERY_METHODS_KEY, List.class)
+        .tryMap(
+            userDeliveryMethods -> {
+              final List<Map<String, Object>> matchingDestinations =
+                  ((List<Map<String, Object>>) userDeliveryMethods)
+                      .stream()
+                      .filter(
+                          destination ->
+                              MapUtils.tryGet(destination, DELIVERY_METHOD_ID_KEY, String.class)
+                                  .map(deliveryID::equals)
+                                  .orDo(
+                                      error -> {
+                                        LOGGER.error(
+                                            "There was a problem attempting to retrieve the ID for a destination in the given preferences: %s",
+                                            error);
+                                        return false;
+                                      }))
+                      .collect(Collectors.toList());
+              if (matchingDestinations.size() != 1) {
+                return error(
+                    "There were %d destinations matching the ID \"%s\" in the given preferences; only one is expected!",
+                    matchingDestinations.size(), deliveryID);
+              }
+              final Map<String, Object> destinationData = matchingDestinations.get(0);
+
+              return MapUtils.tryGetAndRun(
+                  destinationData,
+                  QueryDeliveryService.DELIVERY_TYPE_KEY,
+                  String.class,
+                  DELIVERY_OPTIONS_KEY,
+                  Map.class,
+                  (deliveryType, deliveryOptions) ->
+                      of(ImmutablePair.of(deliveryType, (Map<String, Object>) deliveryOptions)));
+            });
+  }
+
   private Fallible<?> deliverAll(
       final Collection<String> scheduleDeliveryIDs,
       final String scheduleUsername,
       final Map<String, Object> queryMetacardData,
       final QueryResponse results) {
-    return forEach(
-        scheduleDeliveryIDs,
-        deliveryID ->
-            getDeliveryInfo(scheduleUsername, deliveryID)
-                .prependToError(
-                    "There was a problem retrieving the delivery information with ID \"%s\" for user '%s': ",
-                    deliveryID, scheduleUsername)
-                .tryMap(
-                    deliveryInfo ->
-                        deliver(
-                                deliveryInfo.getLeft(),
-                                queryMetacardData,
-                                results,
-                                scheduleUsername,
-                                deliveryID,
-                                deliveryInfo.getRight())
+    return getUserPreferences(scheduleUsername)
+        .tryMap(
+            userPreferences ->
+                forEach(
+                    scheduleDeliveryIDs,
+                    deliveryID ->
+                        getDeliveryInfo(userPreferences, deliveryID)
                             .prependToError(
-                                "There was a problem delivering query results to delivery info with ID \"%s\" for user '%s': ",
-                                deliveryID, scheduleUsername)));
+                                "There was a problem retrieving the delivery information with ID \"%s\" for user '%s': ",
+                                deliveryID, scheduleUsername)
+                            .tryMap(
+                                deliveryInfo ->
+                                    deliver(
+                                            deliveryInfo.getLeft(),
+                                            queryMetacardData,
+                                            results,
+                                            scheduleUsername,
+                                            deliveryID,
+                                            deliveryInfo.getRight())
+                                        .prependToError(
+                                            "There was a problem delivering query results to delivery info with ID \"%s\" for user '%s': ",
+                                            deliveryID, scheduleUsername))));
   }
 
   private Fallible<SchedulerFuture<?>> scheduleJob(
