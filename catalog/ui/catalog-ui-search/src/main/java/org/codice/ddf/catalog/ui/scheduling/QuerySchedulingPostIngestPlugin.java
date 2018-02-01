@@ -185,7 +185,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
       final String deliveryType,
       final Map<String, Object> queryMetacardData,
       final QueryResponse results,
-      final String username,
+      final String userID,
       final String deliveryID,
       final Map<String, Object> deliveryParameters) {
     final String filter = String.format("(objectClass=%s)", QueryDeliveryService.class.getName());
@@ -227,26 +227,24 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
 
     return selectedServices
         .get(0)
-        .deliver(queryMetacardData, results, username, deliveryID, deliveryParameters);
+        .deliver(queryMetacardData, results, userID, deliveryID, deliveryParameters);
   }
 
-  // TODO: change instances of "username" to "userID" now that the user's ID is being used instead
-  // of the username
-  private Fallible<Map<String, Object>> getUserPreferences(final String username) {
+  private Fallible<Map<String, Object>> getUserPreferences(final String userID) {
     List<Map<String, Object>> preferencesList;
     try {
       preferencesList =
           persistentStore.get(
-              PersistenceType.PREFERENCES_TYPE.toString(), String.format("user = '%s'", username));
+              PersistenceType.PREFERENCES_TYPE.toString(), String.format("user = '%s'", userID));
     } catch (PersistenceException exception) {
       return error(
           "There was a problem attempting to retrieve the preferences for user '%s': %s",
-          username, exception.getMessage());
+          userID, exception.getMessage());
     }
     if (preferencesList.size() != 1) {
       return error(
           "There were %d preference entries found for user '%s'!",
-          preferencesList.size(), username);
+          preferencesList.size(), userID);
     }
     final Map<String, Object> preferencesItem = preferencesList.get(0);
 
@@ -262,7 +260,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
               } catch (JsonException exception) {
                 return error(
                     "There was an error parsing the preferences for user '%s': %s",
-                    username, exception.getMessage());
+                    userID, exception.getMessage());
               }
 
               return of(preferences);
@@ -309,10 +307,10 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
 
   private Fallible<?> deliverAll(
       final Collection<String> scheduleDeliveryIDs,
-      final String scheduleUsername,
+      final String scheduleUserID,
       final Map<String, Object> queryMetacardData,
       final QueryResponse results) {
-    return getUserPreferences(scheduleUsername)
+    return getUserPreferences(scheduleUserID)
         .tryMap(
             userPreferences ->
                 forEach(
@@ -321,27 +319,27 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                         getDeliveryInfo(userPreferences, deliveryID)
                             .prependToError(
                                 "There was a problem retrieving the delivery information with ID \"%s\" for user '%s': ",
-                                deliveryID, scheduleUsername)
+                                deliveryID, scheduleUserID)
                             .tryMap(
                                 deliveryInfo ->
                                     deliver(
                                             deliveryInfo.getLeft(),
                                             queryMetacardData,
                                             results,
-                                            scheduleUsername,
+                                            scheduleUserID,
                                             deliveryID,
                                             deliveryInfo.getRight())
                                         .prependToError(
                                             "There was a problem delivering query results to delivery info with ID \"%s\" for user '%s': ",
-                                            deliveryID, scheduleUsername))));
+                                            deliveryID, scheduleUserID))));
   }
 
   private Fallible<SchedulerFuture<?>> scheduleJob(
       final IgniteScheduler scheduler,
       final Map<String, Object> queryMetacardData,
-      final String queryMetacardId,
+      final String queryMetacardID,
       final String cqlQuery,
-      final String scheduleUsername,
+      final String scheduleUserID,
       final int scheduleInterval,
       final String scheduleUnit,
       final String scheduleStartString,
@@ -390,7 +388,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                 public void run() {
                   final boolean isRunning =
                       runningQueries
-                          .map(runningQueries -> runningQueries.containsKey(queryMetacardId))
+                          .map(runningQueries -> runningQueries.containsKey(queryMetacardID))
                           .or(true);
                   if (!isRunning) {
                     return;
@@ -410,7 +408,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                             results ->
                                 deliverAll(
                                     scheduleDeliveryIDs,
-                                    scheduleUsername,
+                                    scheduleUserID,
                                     queryMetacardData,
                                     results))
                         .elseDo(LOGGER::error);
@@ -421,10 +419,10 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
     } catch (IgniteException exception) {
       return error(
           "There was a problem attempting to schedule a job for a query metacard \"%s\": %s",
-          queryMetacardId, exception.getMessage());
+          queryMetacardID, exception.getMessage());
     }
 
-    runningQueries.ifValue(runningQueries -> runningQueries.put(queryMetacardId, 0));
+    runningQueries.ifValue(runningQueries -> runningQueries.put(queryMetacardID, 0));
 
     job.listen(
         future ->
@@ -434,8 +432,8 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                     final SchedulerFuture<?> jobFuture = (SchedulerFuture<?>) future;
                     if (jobFuture.nextExecutionTime() == 0
                         || jobFuture.nextExecutionTime() > end.getMillis()
-                        || !runningQueries.containsKey(queryMetacardId)) {
-                      runningQueries.remove(queryMetacardId);
+                        || !runningQueries.containsKey(queryMetacardID)) {
+                      runningQueries.remove(queryMetacardID);
                       jobFuture.cancel();
                     }
                   }
@@ -459,7 +457,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
 
               return MapUtils.tryGetAndRun(
                   scheduleData,
-                  ScheduleMetacardTypeImpl.SCHEDULE_USERNAME,
+                  ScheduleMetacardTypeImpl.SCHEDULE_USER_ID,
                   String.class,
                   ScheduleMetacardTypeImpl.SCHEDULE_AMOUNT,
                   Integer.class,
@@ -471,7 +469,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                   String.class,
                   ScheduleMetacardTypeImpl.SCHEDULE_DELIVERY_IDS,
                   List.class,
-                  (scheduleUsername,
+                  (scheduleUserID,
                       scheduleInterval,
                       scheduleUnit,
                       scheduleStartString,
@@ -482,7 +480,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                           queryMetacardData,
                           queryMetacardId,
                           cqlQuery,
-                          scheduleUsername,
+                          scheduleUserID,
                           scheduleInterval,
                           scheduleUnit,
                           scheduleStartString,
