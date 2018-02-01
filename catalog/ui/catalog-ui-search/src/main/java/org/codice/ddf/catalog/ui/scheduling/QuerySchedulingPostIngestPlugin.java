@@ -110,14 +110,22 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
   private final BundleContext bundleContext =
       FrameworkUtil.getBundle(QuerySchedulingPostIngestPlugin.class).getBundleContext();
 
+  /**
+   * This {@link IgniteScheduler} can be used to schedule jobs to run according to a cron
+   * expression.
+   *
+   * <p>This {@link IgniteCache} will become available as soon as a job is scheduled if a running
+   * {@link Ignite} instance is available.
+   */
   private static Fallible<IgniteScheduler> scheduler =
       error(
           "An Ignite scheduler has not been obtained for this query! Have any queries been started yet?");
 
   /**
    * This {@link IgniteCache} relates metacards to running {@link Ignite} scheduled jobs. Keys are
-   * metacard IDs (unique identifiers of metacards) while values are running {@link Ignite} jobs.
-   * This {@link IgniteCache} will become available as soon as a job is scheduled if a running
+   * the metacard IDs of query metacards with scheduled jobs running; the values are unused.
+   *
+   * <p>This {@link IgniteCache} will become available as soon as a job is scheduled if a running
    * {@link Ignite} instance is available.
    */
   @VisibleForTesting
@@ -243,8 +251,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
     }
     if (preferencesList.size() != 1) {
       return error(
-          "There were %d preference entries found for user '%s'!",
-          preferencesList.size(), userID);
+          "There were %d preference entries found for user '%s'!", preferencesList.size(), userID);
     }
     final Map<String, Object> preferencesItem = preferencesList.get(0);
 
