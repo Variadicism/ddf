@@ -1,13 +1,9 @@
 /**
  * Copyright (c) Codice Foundation
  *
- * <p>
- *
  * <p>This is free software: you can redistribute it and/or modify it under the terms of the GNU
  * Lesser General Public License as published by the Free Software Foundation, either version 3 of
  * the License, or any later version.
- *
- * <p>
  *
  * <p>This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
  * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
@@ -32,8 +28,6 @@ import ddf.catalog.operation.DeleteResponse;
 import ddf.catalog.operation.Query;
 import ddf.catalog.operation.QueryRequest;
 import ddf.catalog.operation.QueryResponse;
-import ddf.catalog.operation.Response;
-import ddf.catalog.operation.Update;
 import ddf.catalog.operation.UpdateResponse;
 import ddf.catalog.operation.impl.QueryImpl;
 import ddf.catalog.operation.impl.QueryRequestImpl;
@@ -45,7 +39,6 @@ import ddf.util.Fallible;
 import ddf.util.MapUtils;
 import java.nio.charset.Charset;
 import java.time.format.DateTimeParseException;
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -289,14 +282,15 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                                   .orDo(
                                       error -> {
                                         LOGGER.error(
-                                            "There was a problem attempting to retrieve the ID for a destination in the given preferences: %s",
-                                            error);
+                                            String.format(
+                                                "There was a problem attempting to retrieve the ID for a destination in the given preferences: %s",
+                                                error));
                                         return false;
                                       }))
                       .collect(Collectors.toList());
               if (matchingDestinations.size() != 1) {
                 return error(
-                    "There were %d destinations matching the ID \"%s\" in the given preferences; only one is expected!",
+                    "There were %d destinations matching the ID \"%s\" in the given preferences; 1 is expected!",
                     matchingDestinations.size(), deliveryID);
               }
               final Map<String, Object> destinationData = matchingDestinations.get(0);
@@ -596,73 +590,41 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                     }));
   }
 
-  private static void throwErrorsIfAny(List<ImmutablePair<Metacard, String>> errors)
-      throws PluginExecutionException {
-    if (!errors.isEmpty()) {
-      throw new PluginExecutionException(
-          errors
-              .stream()
-              .map(
-                  metacardAndError ->
-                      String.format(
-                          "There was an error attempting to modify schedule execution of workspace metacard \"%s\": %s",
-                          metacardAndError.getLeft().getId(), metacardAndError.getRight()))
-              .collect(Collectors.joining("\n")));
-    }
-  }
-
-  private <T extends Response> T processSingularResponse(
-      T response,
-      List<Metacard> metacards,
-      Function<Map<String, Object>, Fallible<?>> metacardAction)
-      throws PluginExecutionException {
-    List<ImmutablePair<Metacard, String>> errors = new ArrayList<>();
-
-    for (Metacard metacard : metacards) {
-      // TODO TEMP
-      LOGGER.debug(
-          String.format("Processing metacard of type %s...", metacard.getMetacardType().getName()));
-      processMetacard(metacard, metacardAction)
-          .elseDo(error -> errors.add(ImmutablePair.of(metacard, error)));
-    }
-
-    throwErrorsIfAny(errors);
-
-    return response;
-  }
-
   @Override
   public CreateResponse process(CreateResponse creation) throws PluginExecutionException {
     // TODO TEMP
     LOGGER.warn("Processing creation...");
-    return processSingularResponse(
-        creation, creation.getCreatedMetacards(), this::readQueryMetacardAndSchedule);
+
+    forEach(
+            creation.getCreatedMetacards(),
+            newMetacard ->
+                processMetacard(newMetacard, this::readQueryMetacardAndSchedule)
+                    .prependToError(
+                        "There was an error attempting to schedule delivery job(s) for the new workspace metacard \"%s\": ",
+                        newMetacard.getId()))
+        .elseThrow(PluginExecutionException::new);
+
+    return creation;
   }
 
   @Override
   public UpdateResponse process(UpdateResponse updates) throws PluginExecutionException {
     // TODO TEMP
     LOGGER.warn("Processing update...");
-    List<ImmutablePair<Metacard, String>> errors = new ArrayList<>();
 
-    for (Update update : updates.getUpdatedMetacards()) {
-      // TODO TEMP
-      LOGGER.warn(
-          String.format(
-              "Processing old metacard of type %s...",
-              update.getOldMetacard().getMetacardType().getName()));
-      processMetacard(update.getOldMetacard(), this::readQueryMetacardAndCancelSchedule)
-          .elseDo(error -> errors.add(ImmutablePair.of(update.getOldMetacard(), error)));
-      // TODO TEMP
-      LOGGER.warn(
-          String.format(
-              "Processing new metacard of type %s...",
-              update.getNewMetacard().getMetacardType().getName()));
-      processMetacard(update.getNewMetacard(), this::readQueryMetacardAndSchedule)
-          .elseDo(error -> errors.add(ImmutablePair.of(update.getNewMetacard(), error)));
-    }
-
-    throwErrorsIfAny(errors);
+    forEach(
+            updates.getUpdatedMetacards(),
+            update ->
+                processMetacard(update.getOldMetacard(), this::readQueryMetacardAndCancelSchedule)
+                    .prependToError(
+                        "There was an error attempting to cancel the scheduled delivery job(s) for the pre-update version of workspace metacard \"%s\": ",
+                        update.getOldMetacard().getId()),
+            update ->
+                processMetacard(update.getNewMetacard(), this::readQueryMetacardAndSchedule)
+                    .prependToError(
+                        "There was an error attempting to schedule delivery job(s) for the post-update version of workspace metacard \"%s\": ",
+                        update.getNewMetacard().getId()))
+        .elseThrow(PluginExecutionException::new);
 
     return updates;
   }
@@ -671,7 +633,16 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
   public DeleteResponse process(DeleteResponse deletion) throws PluginExecutionException {
     // TODO TEMP
     LOGGER.warn("Processing deletion...");
-    return processSingularResponse(
-        deletion, deletion.getDeletedMetacards(), this::readQueryMetacardAndCancelSchedule);
+
+    forEach(
+            deletion.getDeletedMetacards(),
+            deletedMetacard ->
+                processMetacard(deletedMetacard, this::readQueryMetacardAndCancelSchedule)
+                    .prependToError(
+                        "There was an error attempting to cancel the scheduled delivery job(s) for the deleted workspace metacard \"%s\": ",
+                        deletedMetacard.getId()))
+        .elseThrow(PluginExecutionException::new);
+
+    return deletion;
   }
 }
