@@ -16,9 +16,9 @@ package org.codice.ddf.catalog.ui.scheduling;
 import static ddf.util.Fallible.error;
 import static ddf.util.Fallible.forEach;
 import static ddf.util.Fallible.of;
+import static ddf.util.Fallible.ofNullable;
 import static ddf.util.Fallible.success;
 
-import com.google.common.annotations.VisibleForTesting;
 import ddf.catalog.CatalogFramework;
 import ddf.catalog.Constants;
 import ddf.catalog.data.Metacard;
@@ -47,6 +47,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import javax.cache.CacheException;
 import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.ignite.Ignite;
@@ -103,29 +104,6 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
   private final BundleContext bundleContext =
       FrameworkUtil.getBundle(QuerySchedulingPostIngestPlugin.class).getBundleContext();
 
-  /**
-   * This {@link IgniteScheduler} can be used to schedule jobs to run according to a cron
-   * expression.
-   *
-   * <p>This {@link IgniteCache} will become available as soon as a job is scheduled if a running
-   * {@link Ignite} instance is available.
-   */
-  private static Fallible<IgniteScheduler> scheduler =
-      error(
-          "An Ignite scheduler has not been obtained for this query! Have any queries been started yet?");
-
-  /**
-   * This {@link IgniteCache} relates metacards to running {@link Ignite} scheduled jobs. Keys are
-   * the metacard IDs of query metacards with scheduled jobs running; the values are unused.
-   *
-   * <p>This {@link IgniteCache} will become available as soon as a job is scheduled if a running
-   * {@link Ignite} instance is available.
-   */
-  @VisibleForTesting
-  static Fallible<IgniteCache<String, Integer>> runningQueries =
-      error(
-          "An Ignite cache has not been obtained for this query! Have any queries been started yet?");
-
   private final CatalogFramework catalogFramework;
 
   private final PersistentStore persistentStore;
@@ -144,10 +122,40 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
     LOGGER.warn("Query scheduling plugin created!");
   }
 
-  private Fallible<QueryResponse> runQuery(final String cqlQuery) {
-    // TODO TEMP
-    LOGGER.warn("Emailing metacard owner...");
+  private static Fallible<Ignite> getIgnite() {
+    if (Ignition.state() != IgniteState.STARTED) {
+      return error(
+          "An Ignite instance for scheduling and storing jobs is not currently available!");
+    }
 
+    return of(Ignition.ignite());
+  }
+
+  private static Fallible<IgniteCache<String, Integer>> getRunningQueriesCache(boolean create) {
+    return getIgnite()
+        .tryMap(
+            ignite -> {
+              try {
+                if (create) {
+                  return of(ignite.getOrCreateCache(QUERIES_CACHE_NAME));
+                } else {
+                  return ofNullable(
+                      ignite.cache(QUERIES_CACHE_NAME),
+                      "A cache does not currently exist for scheduled query data!");
+                }
+              } catch (CacheException exception) {
+                return error(
+                    "There was a problem attempting to retrieve a cache for running query data: %s",
+                    exception.getMessage());
+              }
+            });
+  }
+
+  private static Fallible<IgniteScheduler> getScheduler() {
+    return getIgnite().map(Ignite::scheduler);
+  }
+
+  private Fallible<QueryResponse> runQuery(final String cqlQuery) {
     Filter filter;
     try {
       filter = ECQL.toFilter(cqlQuery);
@@ -335,7 +343,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                                             deliveryID, scheduleUserID))));
   }
 
-  private Fallible<SchedulerFuture<?>> scheduleJob(
+  private Fallible<SchedulerFuture<?>> schedule(
       final IgniteScheduler scheduler,
       final Map<String, Object> queryMetacardData,
       final String queryMetacardID,
@@ -359,6 +367,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
           "The start date attribute of this metacard, \"%s\", could not be parsed: %s",
           scheduleStartString, exception.getMessage());
     }
+
     try {
       end = DateTime.parse(scheduleEndString, ISO_8601_DATE_FORMAT);
     } catch (DateTimeParseException exception) {
@@ -387,16 +396,26 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
 
                 @Override
                 public void run() {
+                  // TODO TEMP
+                  LOGGER.warn("Acquiring and delivering metacard data...");
+
                   final boolean isRunning =
-                      runningQueries
+                      getRunningQueriesCache(false)
                           .map(runningQueries -> runningQueries.containsKey(queryMetacardID))
-                          .or(true);
+                          .orDo(
+                              error -> {
+                                LOGGER.warn(
+                                    String.format(
+                                        "Running query data could not be found when the query via metacard \"%s\" ran: %s\nForcing assumption that this scheduled query was not cancelled by the user...",
+                                        queryMetacardID, error));
+                                return true;
+                              });
                   if (!isRunning) {
                     return;
                   }
 
                   final DateTime now = DateTime.now();
-                  if (start.compareTo(now) <= 0) {
+                  if (start.compareTo(now) <= 0 && end.compareTo(now) >= 0) {
                     if (unitsPassedSinceStarted < scheduleInterval - 1) {
                       unitsPassedSinceStarted++;
                       return;
@@ -423,22 +442,33 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
           queryMetacardID, exception.getMessage());
     }
 
-    runningQueries.ifValue(runningQueries -> runningQueries.put(queryMetacardID, 0));
-
     job.listen(
-        future ->
-            runningQueries.ifValue(
-                runningQueries -> {
-                  if (future instanceof SchedulerFuture) {
-                    final SchedulerFuture<?> jobFuture = (SchedulerFuture<?>) future;
-                    if (jobFuture.nextExecutionTime() == 0
-                        || jobFuture.nextExecutionTime() > end.getMillis()
-                        || !runningQueries.containsKey(queryMetacardID)) {
-                      runningQueries.remove(queryMetacardID);
-                      jobFuture.cancel();
-                    }
-                  }
-                }));
+        future -> {
+          if (future instanceof SchedulerFuture) {
+            final SchedulerFuture<?> jobFuture = (SchedulerFuture<?>) future;
+            final Fallible<IgniteCache<String, Integer>> runningQueriesOrError =
+                getRunningQueriesCache(false);
+
+            final boolean isCancelledByCache =
+                runningQueriesOrError
+                    .map(runningQueries -> !runningQueries.containsKey(queryMetacardID))
+                    .orDo(
+                        error -> {
+                          LOGGER.warn(
+                              String.format(
+                                  "Running query data could not be found when the cancellation listener for the query via metacard \"%s\" ran: %s\nForcing assumption that this scheduled query was not cancelled by the user...",
+                                  queryMetacardID, error));
+                          return false;
+                        });
+            if (jobFuture.nextExecutionTime() == 0
+                || jobFuture.nextExecutionTime() > end.getMillis()
+                || isCancelledByCache) {
+              runningQueriesOrError.ifValue(
+                  runningQueries -> runningQueries.remove(queryMetacardID));
+              jobFuture.cancel();
+            }
+          }
+        });
 
     return of(job);
   }
@@ -476,7 +506,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                       scheduleStartString,
                       scheduleEndString,
                       scheduleDeliveries) ->
-                      scheduleJob(
+                      schedule(
                           scheduler,
                           queryMetacardData,
                           queryMetacardId,
@@ -491,70 +521,55 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
   }
 
   private Fallible<?> readQueryMetacardAndSchedule(final Map<String, Object> queryMetacardData) {
-    if (Ignition.state() != IgniteState.STARTED) {
-      return error("Cron queries cannot be scheduled without a running Ignite instance!");
-    }
+    return getRunningQueriesCache(true)
+        .tryMap(
+            runningQueries ->
+                getScheduler()
+                    .tryMap(
+                        scheduler ->
+                            MapUtils.tryGetAndRun(
+                                queryMetacardData,
+                                Metacard.ID,
+                                String.class,
+                                queryMetacardID -> {
+                                  if (runningQueries.containsKey(queryMetacardID)) {
+                                    return error(
+                                        "This query cannot be scheduled because a job is already scheduled for it!");
+                                  }
 
-    final Ignite ignite = Ignition.ignite();
-
-    final IgniteScheduler scheduler =
-        QuerySchedulingPostIngestPlugin.scheduler.orDo(
-            error -> {
-              final IgniteScheduler newScheduler = ignite.scheduler();
-              QuerySchedulingPostIngestPlugin.scheduler = of(newScheduler);
-              return newScheduler;
-            });
-
-    final IgniteCache<String, ?> runningQueries =
-        QuerySchedulingPostIngestPlugin.runningQueries.orDo(
-            error -> {
-              final IgniteCache<String, Integer> newCache =
-                  ignite.getOrCreateCache(QUERIES_CACHE_NAME);
-              QuerySchedulingPostIngestPlugin.runningQueries = of(newCache);
-              return newCache;
-            });
-
-    return MapUtils.tryGetAndRun(
-        queryMetacardData,
-        Metacard.ID,
-        String.class,
-        queryMetacardId -> {
-          if (runningQueries.containsKey(queryMetacardId)) {
-            return error(
-                "This query cannot be scheduled because a job is already scheduled for it!");
-          }
-
-          return MapUtils.tryGetAndRun(
-              queryMetacardData,
-              QueryMetacardTypeImpl.QUERY_CQL,
-              String.class,
-              QueryMetacardTypeImpl.QUERY_SCHEDULES,
-              List.class,
-              (cqlQuery, schedulesData) ->
-                  forEach(
-                      (List<Map<String, Object>>) schedulesData,
-                      scheduleData ->
-                          readScheduleDataAndSchedule(
-                              scheduler,
-                              queryMetacardData,
-                              queryMetacardId,
-                              cqlQuery,
-                              scheduleData)));
-        });
+                                  return MapUtils.tryGetAndRun(
+                                          queryMetacardData,
+                                          QueryMetacardTypeImpl.QUERY_CQL,
+                                          String.class,
+                                          QueryMetacardTypeImpl.QUERY_SCHEDULES,
+                                          List.class,
+                                          (cqlQuery, schedulesData) ->
+                                              forEach(
+                                                  (List<Map<String, Object>>) schedulesData,
+                                                  scheduleData ->
+                                                      readScheduleDataAndSchedule(
+                                                          scheduler,
+                                                          queryMetacardData,
+                                                          queryMetacardID,
+                                                          cqlQuery,
+                                                          scheduleData)))
+                                      .ifValue(status -> runningQueries.put(queryMetacardID, 0));
+                                })));
   }
 
   private static Fallible<?> cancelSchedule(final String queryMetacardId) {
-    return runningQueries.tryMap(
-        runningQueries -> {
-          try {
-            runningQueries.remove(queryMetacardId);
-          } catch (TransactionException exception) {
-            return error(
-                "There was a problem attempting to cancel a job for the query metacard \"%s\": %s",
-                queryMetacardId, exception.getMessage());
-          }
-          return success();
-        });
+    return getRunningQueriesCache(false)
+        .tryMap(
+            runningQueries -> {
+              try {
+                runningQueries.remove(queryMetacardId);
+              } catch (TransactionException exception) {
+                return error(
+                    "There was a problem attempting to cancel a job for the query metacard \"%s\": %s",
+                    queryMetacardId, exception.getMessage());
+              }
+              return success();
+            });
   }
 
   private Fallible<?> readQueryMetacardAndCancelSchedule(
