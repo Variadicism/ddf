@@ -106,22 +106,24 @@ public class Fallible<Value> {
       Collection<Input> inputs,
       Function<Input, Fallible<?>> firstMapper,
       Function<Input, Fallible<?>>... moreMappers) {
-    final Stream<Function<Input, Fallible<?>>> mappers =
-        Stream.concat(Stream.of(firstMapper), Arrays.stream(moreMappers));
     final String errors =
         inputs
             .stream()
             .flatMap(
                 input ->
-                    mappers.map(
-                        mapper ->
-                            mapper.apply(input).mapValue((String) null).orDo(Function.identity())))
+                    Stream.concat(Stream.of(firstMapper), Arrays.stream(moreMappers))
+                        .map(
+                            mapper ->
+                                mapper
+                                    .apply(input)
+                                    .mapValue((String) null)
+                                    .orDo(Function.identity())))
             .filter(Objects::nonNull)
             .collect(Collectors.joining("\n"));
+
     if (errors.isEmpty()) {
       return success();
     }
-
     return error(errors);
   }
 

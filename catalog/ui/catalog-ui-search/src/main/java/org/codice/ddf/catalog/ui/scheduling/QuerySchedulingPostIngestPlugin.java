@@ -72,6 +72,7 @@ import org.codice.ddf.security.common.Security;
 import org.geotools.filter.text.cql2.CQLException;
 import org.geotools.filter.text.ecql.ECQL;
 import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
 import org.joda.time.format.DateTimeFormat;
 import org.joda.time.format.DateTimeFormatter;
 import org.opengis.filter.Filter;
@@ -343,7 +344,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                                             deliveryID, scheduleUserID))));
   }
 
-  private Fallible<SchedulerFuture<?>> schedule(
+  private Fallible<?> schedule(
       final IgniteScheduler scheduler,
       final Map<String, Object> queryMetacardData,
       final String queryMetacardID,
@@ -358,16 +359,7 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
       return error("A task cannot be executed every %d %s!", scheduleInterval, scheduleUnit);
     }
 
-    DateTime start;
-    DateTime end;
-    try {
-      start = DateTime.parse(scheduleStartString, ISO_8601_DATE_FORMAT);
-    } catch (DateTimeParseException exception) {
-      return error(
-          "The start date attribute of this metacard, \"%s\", could not be parsed: %s",
-          scheduleStartString, exception.getMessage());
-    }
-
+    final DateTime end;
     try {
       end = DateTime.parse(scheduleEndString, ISO_8601_DATE_FORMAT);
     } catch (DateTimeParseException exception) {
@@ -376,7 +368,16 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
           scheduleStartString, exception.getMessage());
     }
 
-    RepetitionTimeUnit unit;
+    final DateTime start;
+    try {
+      start = DateTime.parse(scheduleStartString, ISO_8601_DATE_FORMAT);
+    } catch (DateTimeParseException exception) {
+      return error(
+          "The start date attribute of this metacard, \"%s\", could not be parsed: %s",
+          scheduleStartString, exception.getMessage());
+    }
+
+    final RepetitionTimeUnit unit;
     try {
       unit = RepetitionTimeUnit.valueOf(scheduleUnit.toUpperCase());
     } catch (IllegalArgumentException exception) {
@@ -397,7 +398,9 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
                 @Override
                 public void run() {
                   // TODO TEMP
-                  LOGGER.warn("Acquiring and delivering metacard data...");
+                  LOGGER.warn(
+                      String.format(
+                          "Acquiring and delivering metacard data for %s...", queryMetacardID));
 
                   final boolean isRunning =
                       getRunningQueriesCache(false)
@@ -423,6 +426,10 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
 
                     unitsPassedSinceStarted = 0;
 
+                    // TODO TEMP
+                    LOGGER.warn(
+                        String.format("Running query for query metacard %s...", queryMetacardID));
+
                     runQuery(cqlQuery)
                         .tryMap(
                             results ->
@@ -442,35 +449,40 @@ public class QuerySchedulingPostIngestPlugin implements PostIngestPlugin {
           queryMetacardID, exception.getMessage());
     }
 
-    job.listen(
-        future -> {
-          if (future instanceof SchedulerFuture) {
-            final SchedulerFuture<?> jobFuture = (SchedulerFuture<?>) future;
-            final Fallible<IgniteCache<String, Integer>> runningQueriesOrError =
-                getRunningQueriesCache(false);
+    final Function<SchedulerFuture<?>, Boolean> hasNextRun =
+        jobFuture ->
+            jobFuture.nextExecutionTime() == 0
+                || end.compareTo(new DateTime(jobFuture.nextExecutionTime(), DateTimeZone.UTC))
+                    >= 0;
 
-            final boolean isCancelledByCache =
-                runningQueriesOrError
-                    .map(runningQueries -> !runningQueries.containsKey(queryMetacardID))
-                    .orDo(
-                        error -> {
-                          LOGGER.warn(
-                              String.format(
-                                  "Running query data could not be found when the cancellation listener for the query via metacard \"%s\" ran: %s\nForcing assumption that this scheduled query was not cancelled by the user...",
-                                  queryMetacardID, error));
-                          return false;
-                        });
-            if (jobFuture.nextExecutionTime() == 0
-                || jobFuture.nextExecutionTime() > end.getMillis()
-                || isCancelledByCache) {
-              runningQueriesOrError.ifValue(
-                  runningQueries -> runningQueries.remove(queryMetacardID));
-              jobFuture.cancel();
-            }
+    if (!hasNextRun.apply(job)) {
+      job.cancel();
+      return success();
+    }
+
+    job.listen(
+        a -> {
+          final Fallible<IgniteCache<String, Integer>> runningQueriesOrError =
+              getRunningQueriesCache(false);
+
+          final boolean isCancelledByCache =
+              runningQueriesOrError
+                  .map(runningQueries -> !runningQueries.containsKey(queryMetacardID))
+                  .orDo(
+                      error -> {
+                        LOGGER.warn(
+                            String.format(
+                                "Running query data could not be found when the cancellation listener for the query via metacard \"%s\" ran: %s\nForcing assumption that this scheduled query was not cancelled by the user...",
+                                queryMetacardID, error));
+                        return false;
+                      });
+          if (!hasNextRun.apply(job) || isCancelledByCache) {
+            runningQueriesOrError.ifValue(runningQueries -> runningQueries.remove(queryMetacardID));
+            job.cancel();
           }
         });
 
-    return of(job);
+    return success();
   }
 
   private Fallible<?> readScheduleDataAndSchedule(
